@@ -20,14 +20,19 @@ function pickRandom(items) {
   return items[Math.floor(Math.random() * items.length)];
 }
 
+function parseISO8601Duration(duration) {
+  const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return 0;
+
+  const hours = Number(match[1] || 0);
+  const minutes = Number(match[2] || 0);
+  const seconds = Number(match[3] || 0);
+
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
 async function findDiscogsRelease(filters) {
-  const {
-    genre,
-    style,
-    region,
-    yearFrom,
-    yearTo,
-  } = filters;
+  const { genre, style, region, yearFrom, yearTo } = filters;
 
   const randomYear =
     Math.floor(Math.random() * (yearTo - yearFrom + 1)) + yearFrom;
@@ -74,7 +79,7 @@ async function findDiscogsRelease(filters) {
   };
 }
 
-async function findYoutubeVideo(query, maxViews) {
+async function findYoutubeVideo(query, filters) {
   const searchParams = new URLSearchParams({
     part: 'snippet',
     type: 'video',
@@ -94,7 +99,7 @@ async function findYoutubeVideo(query, maxViews) {
   const ids = searchData.items.map((item) => item.id.videoId).join(',');
 
   const detailsParams = new URLSearchParams({
-    part: 'snippet,statistics',
+    part: 'snippet,statistics,contentDetails',
     id: ids,
     key: process.env.YOUTUBE_API_KEY,
   });
@@ -108,14 +113,26 @@ async function findYoutubeVideo(query, maxViews) {
   if (!detailsData.items || detailsData.items.length === 0) return null;
 
   const candidates = detailsData.items
-    .map((video) => ({
-      youtubeId: video.id,
-      youtubeTitle: video.snippet.title,
-      youtubeChannel: video.snippet.channelTitle,
-      youtubeThumb: video.snippet.thumbnails?.high?.url,
-      youtubeViews: Number(video.statistics?.viewCount || 0),
-    }))
-    .filter((video) => !maxViews || video.youtubeViews <= maxViews);
+    .map((video) => {
+      const durationSeconds = parseISO8601Duration(video.contentDetails?.duration || 'PT0S');
+
+      return {
+        youtubeId: video.id,
+        youtubeTitle: video.snippet.title,
+        youtubeChannel: video.snippet.channelTitle,
+        youtubeThumb: video.snippet.thumbnails?.high?.url,
+        youtubeViews: Number(video.statistics?.viewCount || 0),
+        durationSeconds,
+      };
+    })
+    .filter((video) => {
+      const viewsOk = !filters.maxViews || video.youtubeViews <= filters.maxViews;
+      const durationOk =
+        video.durationSeconds >= filters.minDuration &&
+        video.durationSeconds <= filters.maxDuration;
+
+      return viewsOk && durationOk;
+    });
 
   if (candidates.length === 0) return null;
 
@@ -131,6 +148,8 @@ app.get('/sample', async (req, res) => {
       yearFrom: Number(req.query.yearFrom || 1970),
       yearTo: Number(req.query.yearTo || 1985),
       maxViews: req.query.maxViews ? Number(req.query.maxViews) : null,
+      minDuration: Number(req.query.minDuration || 30),
+      maxDuration: Number(req.query.maxDuration || 1200),
     };
 
     for (let i = 0; i < 10; i++) {
@@ -138,7 +157,7 @@ app.get('/sample', async (req, res) => {
       if (!release) continue;
 
       const youtubeQuery = `${release.title} ${release.year || ''}`;
-      const youtube = await findYoutubeVideo(youtubeQuery, filters.maxViews);
+      const youtube = await findYoutubeVideo(youtubeQuery, filters);
 
       if (!youtube) continue;
 
@@ -161,6 +180,6 @@ app.get('/sample', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Disco Rider backend running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`The Big Dig backend running on port ${PORT}`);
 });

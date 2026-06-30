@@ -16,6 +16,10 @@ const REGION_TO_COUNTRIES = {
   Oceania: ['Australia', 'New Zealand'],
 };
 
+function logDebug(label, data = {}) {
+  console.log(`[BIGDIG DEBUG] ${label}`, JSON.stringify(data, null, 2));
+}
+
 function pickRandom(items) {
   return items[Math.floor(Math.random() * items.length)];
 }
@@ -32,7 +36,11 @@ function parseISO8601Duration(duration = '') {
 }
 
 function normalizeText(text = '') {
-  return text.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function cleanReleaseTitle(title = '') {
@@ -66,32 +74,67 @@ function isBadYoutubeMatch(videoTitle = '', channelTitle = '') {
     'samplette',
     'sampling',
     'sample pack',
-    'cover version',
     'karaoke',
+    'cover version',
     'instrumental remake',
     'sped up',
     'slowed',
     'nightcore',
     'shorts',
     '#shorts',
-    'live stream',
-    'livestream',
     'interview',
     'documentary',
     'commercial',
     'advert',
-    'adverts',
   ];
 
   return badWords.some((word) => text.includes(word));
 }
 
+function isLikelyRemixOrLive(videoTitle = '') {
+  const text = normalizeText(videoTitle);
+
+  const badWords = [
+    'remix',
+    'edit',
+    're edit',
+    'bootleg',
+    'mashup',
+    'live',
+    'concert',
+    'cover',
+    'karaoke',
+    'instrumental',
+  ];
+
+  return badWords.some((word) => text.includes(word));
+}
+
+function getQueryWords(query = '') {
+  return normalizeText(query)
+    .split(/\s+/)
+    .filter((word) => word.length > 3);
+}
+
+function titleMatchRatio(videoTitle, query) {
+  const title = normalizeText(videoTitle);
+  const words = getQueryWords(query);
+
+  if (words.length === 0) return 0;
+
+  const matched = words.filter((word) => title.includes(word));
+  return matched.length / words.length;
+}
+
 function scoreYoutubeCandidate(video, query) {
   const title = normalizeText(video.youtubeTitle);
   const channel = normalizeText(video.youtubeChannel);
-  const q = normalizeText(query);
 
   let score = 0;
+
+  const ratio = titleMatchRatio(video.youtubeTitle, query);
+
+  score += ratio * 20;
 
   if (channel.includes('topic')) score += 12;
   if (title.includes('official audio')) score += 10;
@@ -103,24 +146,25 @@ function scoreYoutubeCandidate(video, query) {
   if (title.includes('remaster')) score += 2;
   if (title.includes('vinyl')) score += 1;
 
-  const queryWords = q.split(/\s+/).filter((word) => word.length > 3);
-  const matchedWords = queryWords.filter((word) => title.includes(word));
-
-  score += matchedWords.length * 2;
-
-  if (queryWords.length > 0 && matchedWords.length / queryWords.length >= 0.5) {
-    score += 6;
-  }
-
+  if (video.durationSeconds >= 90 && video.durationSeconds <= 600) score += 4;
   if (video.youtubeViews > 0) score += 1;
-  if (video.durationSeconds >= 90 && video.durationSeconds <= 600) score += 3;
 
-  if (title.includes('record')) score -= 3;
-  if (title.includes('turntable')) score -= 8;
-  if (title.includes('collection')) score -= 8;
-  if (title.includes('review')) score -= 8;
+  if (isLikelyRemixOrLive(video.youtubeTitle)) score -= 10;
+  if (title.includes('record')) score -= 4;
+  if (title.includes('turntable')) score -= 10;
+  if (title.includes('collection')) score -= 10;
+  if (title.includes('review')) score -= 10;
 
   return score;
+}
+
+function getObscurityLabel(popularityViews) {
+  if (!popularityViews || popularityViews < 5000) return 'Deep Dig';
+  if (popularityViews < 50000) return 'Obscure';
+  if (popularityViews < 250000) return 'Rare';
+  if (popularityViews < 1000000) return 'Known';
+  if (popularityViews < 10000000) return 'Popular';
+  return 'Big Hit';
 }
 
 async function findDiscogsRelease(filters) {
@@ -145,16 +189,21 @@ async function findDiscogsRelease(filters) {
   params.append('token', process.env.DISCOGS_TOKEN);
 
   const url = `https://api.discogs.com/database/search?${params.toString()}`;
+
   const response = await fetch(url);
   const data = await response.json();
 
-  if (!data.results || data.results.length === 0) return null;
+  if (data.error) {
+    logDebug('Discogs error', { error: data.error });
+    return null;
+  }
 
-  const filtered = data.results.filter((item) => {
-    if (!item.title) return false;
-    if (!item.year) return false;
-    return true;
-  });
+  if (!data.results || data.results.length === 0) {
+    logDebug('No Discogs results', { filters });
+    return null;
+  }
+
+  const filtered = data.results.filter((item) => item.title && item.year);
 
   if (filtered.length === 0) return null;
 
@@ -179,6 +228,74 @@ async function findDiscogsRelease(filters) {
   };
 }
 
+async function fetchYoutubeVideos(searchQuery) {
+  const searchParams = new URLSearchParams({
+    part: 'snippet',
+    type: 'video',
+    videoEmbeddable: 'true',
+    maxResults: '10',
+    q: searchQuery,
+    key: process.env.YOUTUBE_API_KEY,
+  });
+
+  const searchUrl = `https://www.googleapis.com/youtube/v3/search?${searchParams.toString()}`;
+  const searchResponse = await fetch(searchUrl);
+  const searchData = await searchResponse.json();
+
+  if (searchData.error) {
+    logDebug('YouTube search error', {
+      query: searchQuery,
+      error: searchData.error,
+    });
+    return [];
+  }
+
+  if (!searchData.items || searchData.items.length === 0) {
+    logDebug('YouTube search no items', { query: searchQuery });
+    return [];
+  }
+
+  const ids = searchData.items.map((item) => item.id.videoId).filter(Boolean).join(',');
+  if (!ids) return [];
+
+  const detailsParams = new URLSearchParams({
+    part: 'snippet,statistics,contentDetails,status',
+    id: ids,
+    key: process.env.YOUTUBE_API_KEY,
+  });
+
+  const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?${detailsParams.toString()}`;
+  const detailsResponse = await fetch(detailsUrl);
+  const detailsData = await detailsResponse.json();
+
+  if (detailsData.error) {
+    logDebug('YouTube details error', {
+      ids,
+      error: detailsData.error,
+    });
+    return [];
+  }
+
+  if (!detailsData.items || detailsData.items.length === 0) {
+    logDebug('YouTube details no items', { ids });
+    return [];
+  }
+
+  return detailsData.items.map((video) => {
+    const durationSeconds = parseISO8601Duration(video.contentDetails?.duration || 'PT0S');
+
+    return {
+      youtubeId: video.id,
+      youtubeTitle: video.snippet?.title || '',
+      youtubeChannel: video.snippet?.channelTitle || '',
+      youtubeThumb: video.snippet?.thumbnails?.high?.url,
+      youtubeViews: Number(video.statistics?.viewCount || 0),
+      durationSeconds,
+      embeddable: video.status?.embeddable !== false,
+    };
+  });
+}
+
 async function findYoutubeVideo(query, filters) {
   const cleanQuery = cleanReleaseTitle(query);
 
@@ -192,50 +309,7 @@ async function findYoutubeVideo(query, filters) {
   let allVideos = [];
 
   for (const searchQuery of searchQueries) {
-    const searchParams = new URLSearchParams({
-      part: 'snippet',
-      type: 'video',
-      videoEmbeddable: 'true',
-      maxResults: '10',
-      q: searchQuery,
-      key: process.env.YOUTUBE_API_KEY,
-    });
-
-    const searchUrl = `https://www.googleapis.com/youtube/v3/search?${searchParams.toString()}`;
-    const searchResponse = await fetch(searchUrl);
-    const searchData = await searchResponse.json();
-
-    if (!searchData.items || searchData.items.length === 0) continue;
-
-    const ids = searchData.items.map((item) => item.id.videoId).filter(Boolean).join(',');
-    if (!ids) continue;
-
-    const detailsParams = new URLSearchParams({
-      part: 'snippet,statistics,contentDetails,status',
-      id: ids,
-      key: process.env.YOUTUBE_API_KEY,
-    });
-
-    const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?${detailsParams.toString()}`;
-    const detailsResponse = await fetch(detailsUrl);
-    const detailsData = await detailsResponse.json();
-
-    if (!detailsData.items || detailsData.items.length === 0) continue;
-
-    const videos = detailsData.items.map((video) => {
-      const durationSeconds = parseISO8601Duration(video.contentDetails?.duration || 'PT0S');
-
-      return {
-        youtubeId: video.id,
-        youtubeTitle: video.snippet?.title || '',
-        youtubeChannel: video.snippet?.channelTitle || '',
-        youtubeThumb: video.snippet?.thumbnails?.high?.url,
-        youtubeViews: Number(video.statistics?.viewCount || 0),
-        durationSeconds,
-        embeddable: video.status?.embeddable !== false,
-      };
-    });
-
+    const videos = await fetchYoutubeVideos(searchQuery);
     allVideos = [...allVideos, ...videos];
   }
 
@@ -243,36 +317,102 @@ async function findYoutubeVideo(query, filters) {
     new Map(allVideos.map((video) => [video.youtubeId, video])).values()
   );
 
-  const candidates = uniqueVideos
-    .filter((video) => {
-      const viewsOk = !filters.maxViews || video.youtubeViews <= filters.maxViews;
-      const minViewsOk = !filters.minViews || video.youtubeViews >= filters.minViews;
-
-      const durationOk =
-        video.durationSeconds >= filters.minDuration &&
-        video.durationSeconds <= filters.maxDuration;
-
-      const notBad = !isBadYoutubeMatch(video.youtubeTitle, video.youtubeChannel);
-
-      return (
-        video.youtubeId &&
-        video.embeddable &&
-        viewsOk &&
-        minViewsOk &&
-        durationOk &&
-        notBad
-      );
-    })
+  const scoredVideos = uniqueVideos
     .map((video) => ({
       ...video,
       matchScore: scoreYoutubeCandidate(video, cleanQuery),
+      matchRatio: titleMatchRatio(video.youtubeTitle, cleanQuery),
+      badMatch: isBadYoutubeMatch(video.youtubeTitle, video.youtubeChannel),
+      remixOrLive: isLikelyRemixOrLive(video.youtubeTitle),
     }))
-    .filter((video) => video.matchScore >= 6)
     .sort((a, b) => b.matchScore - a.matchScore);
 
-  if (candidates.length === 0) return null;
+  const strictCandidates = scoredVideos.filter((video) => {
+    const viewsOk = !filters.maxViews || video.youtubeViews <= filters.maxViews;
+    const minViewsOk = !filters.minViews || video.youtubeViews >= filters.minViews;
 
-  return candidates[0];
+    const durationOk =
+      video.durationSeconds >= filters.minDuration &&
+      video.durationSeconds <= filters.maxDuration;
+
+    return (
+      video.youtubeId &&
+      video.embeddable &&
+      viewsOk &&
+      minViewsOk &&
+      durationOk &&
+      !video.badMatch &&
+      !video.remixOrLive &&
+      video.matchScore >= 7 &&
+      video.matchRatio >= 0.35
+    );
+  });
+
+  const relaxedCandidates = scoredVideos.filter((video) => {
+    const viewsOk = !filters.maxViews || video.youtubeViews <= filters.maxViews;
+    const minViewsOk = !filters.minViews || video.youtubeViews >= filters.minViews;
+
+    const durationOk =
+      video.durationSeconds >= filters.minDuration &&
+      video.durationSeconds <= filters.maxDuration;
+
+    return (
+      video.youtubeId &&
+      video.embeddable &&
+      viewsOk &&
+      minViewsOk &&
+      durationOk &&
+      !video.badMatch &&
+      video.matchScore >= 3 &&
+      video.matchRatio >= 0.2
+    );
+  });
+
+  const chosenPool = strictCandidates.length > 0 ? strictCandidates : relaxedCandidates;
+
+  if (chosenPool.length === 0) {
+    logDebug('No YouTube candidates survived', {
+      query,
+      cleanQuery,
+      totalVideosFound: uniqueVideos.length,
+      filters,
+      sampleVideos: scoredVideos.slice(0, 8).map((video) => ({
+        title: video.youtubeTitle,
+        channel: video.youtubeChannel,
+        views: video.youtubeViews,
+        duration: video.durationSeconds,
+        embeddable: video.embeddable,
+        badMatch: video.badMatch,
+        remixOrLive: video.remixOrLive,
+        score: video.matchScore,
+        ratio: video.matchRatio,
+      })),
+    });
+
+    return null;
+  }
+
+  const bestMatchScore = chosenPool[0].matchScore;
+
+  const sameTrackCandidates = chosenPool.filter((video) => {
+    return video.matchScore >= bestMatchScore - 4 && video.matchRatio >= 0.35;
+  });
+
+  const selectedVideo = sameTrackCandidates.sort(
+    (a, b) => b.youtubeViews - a.youtubeViews
+  )[0];
+
+  const popularityViews = Math.max(
+    ...sameTrackCandidates.map((video) => video.youtubeViews || 0)
+  );
+
+  return {
+    ...selectedVideo,
+    selectedVideoViews: selectedVideo.youtubeViews,
+    popularityViews,
+    obscurityLabel: getObscurityLabel(popularityViews),
+    candidateCount: chosenPool.length,
+  };
 }
 
 app.get('/sample', async (req, res) => {
@@ -289,9 +429,21 @@ app.get('/sample', async (req, res) => {
       maxDuration: Number(req.query.maxDuration || 1200),
     };
 
-    for (let i = 0; i < 15; i++) {
+    logDebug('Sample request', { filters });
+
+    for (let i = 0; i < 25; i++) {
       const release = await findDiscogsRelease(filters);
-      if (!release) continue;
+
+      if (!release) {
+        logDebug('No release found', { attempt: i + 1 });
+        continue;
+      }
+
+      logDebug('Trying release', {
+        attempt: i + 1,
+        title: release.title,
+        year: release.year,
+      });
 
       const youtubeQuery = `${release.cleanTitle || release.title} ${release.year || ''}`;
       const youtube = await findYoutubeVideo(youtubeQuery, filters);

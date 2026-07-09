@@ -7,6 +7,12 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3001;
 
+let requestCounter = 0;
+
+function logDebug(label, data = {}) {
+  console.log(`[BIGDIG DEBUG] ${label}`, JSON.stringify(data, null, 2));
+}
+
 const REGION_TO_COUNTRIES = {
   Europe: ['UK', 'Germany', 'France', 'Italy', 'Netherlands', 'Spain', 'Belgium', 'Sweden'],
   'North America': ['US', 'Canada'],
@@ -190,13 +196,25 @@ async function findDiscogsRelease(filters) {
 
   const url = `https://api.discogs.com/database/search?${params.toString()}`;
 
-  const response = await fetch(url);
-  const data = await response.json();
+const response = await fetch(url);
+const data = await response.json();
 
-  if (data.error) {
-    logDebug('Discogs error', { error: data.error });
-    return null;
-  }
+if (data.message || data.error) {
+  logDebug('Discogs API error', {
+    status: response.status,
+    message: data.message,
+    error: data.error,
+  });
+  return null;
+}
+
+if (!data.results || data.results.length === 0) {
+  logDebug('Discogs no results', {
+    status: response.status,
+    filters,
+  });
+  return null;
+}
 
   if (!data.results || data.results.length === 0) {
     logDebug('No Discogs results', { filters });
@@ -299,122 +317,73 @@ async function fetchYoutubeVideos(searchQuery) {
 async function findYoutubeVideo(query, filters) {
   const cleanQuery = cleanReleaseTitle(query);
 
-  const searchQueries = [
-    `${cleanQuery} official audio`,
-    `${cleanQuery} topic`,
-    `${cleanQuery} audio`,
-    `${cleanQuery}`,
-  ];
+  const videos = await fetchYoutubeVideos(`${cleanQuery} official audio`);
 
-  let allVideos = [];
-
-  for (const searchQuery of searchQueries) {
-    const videos = await fetchYoutubeVideos(searchQuery);
-    allVideos = [...allVideos, ...videos];
+  if (!videos || videos.length === 0) {
+    logDebug('No YouTube videos found', { query, cleanQuery });
+    return null;
   }
 
-  const uniqueVideos = Array.from(
-    new Map(allVideos.map((video) => [video.youtubeId, video])).values()
-  );
+  const scoredVideos = videos
+    .map((video) => {
+      const matchScore = scoreYoutubeCandidate(video, cleanQuery);
 
-  const scoredVideos = uniqueVideos
-    .map((video) => ({
-      ...video,
-      matchScore: scoreYoutubeCandidate(video, cleanQuery),
-      matchRatio: titleMatchRatio(video.youtubeTitle, cleanQuery),
-      badMatch: isBadYoutubeMatch(video.youtubeTitle, video.youtubeChannel),
-      remixOrLive: isLikelyRemixOrLive(video.youtubeTitle),
-    }))
+      return {
+        ...video,
+        matchScore,
+        matchRatio: titleMatchRatio(video.youtubeTitle, cleanQuery),
+        badMatch: isBadYoutubeMatch(video.youtubeTitle, video.youtubeChannel),
+        remixOrLive: isLikelyRemixOrLive(video.youtubeTitle),
+      };
+    })
+    .filter((video) => {
+      const viewsOk = !filters.maxViews || video.youtubeViews <= filters.maxViews;
+      const minViewsOk = !filters.minViews || video.youtubeViews >= filters.minViews;
+
+      const durationOk =
+        video.durationSeconds >= filters.minDuration &&
+        video.durationSeconds <= filters.maxDuration;
+
+      if (!video.youtubeId) return false;
+      if (!video.embeddable) return false;
+      if (!viewsOk) return false;
+      if (!minViewsOk) return false;
+      if (!durationOk) return false;
+      if (video.badMatch) return false;
+      if (video.remixOrLive) return false;
+      if (video.matchRatio < 0.25 && video.matchScore < 8) return false;
+
+      return true;
+    })
     .sort((a, b) => b.matchScore - a.matchScore);
 
-  const strictCandidates = scoredVideos.filter((video) => {
-    const viewsOk = !filters.maxViews || video.youtubeViews <= filters.maxViews;
-    const minViewsOk = !filters.minViews || video.youtubeViews >= filters.minViews;
-
-    const durationOk =
-      video.durationSeconds >= filters.minDuration &&
-      video.durationSeconds <= filters.maxDuration;
-
-    return (
-      video.youtubeId &&
-      video.embeddable &&
-      viewsOk &&
-      minViewsOk &&
-      durationOk &&
-      !video.badMatch &&
-      !video.remixOrLive &&
-      video.matchScore >= 7 &&
-      video.matchRatio >= 0.35
-    );
-  });
-
-  const relaxedCandidates = scoredVideos.filter((video) => {
-    const viewsOk = !filters.maxViews || video.youtubeViews <= filters.maxViews;
-    const minViewsOk = !filters.minViews || video.youtubeViews >= filters.minViews;
-
-    const durationOk =
-      video.durationSeconds >= filters.minDuration &&
-      video.durationSeconds <= filters.maxDuration;
-
-    return (
-      video.youtubeId &&
-      video.embeddable &&
-      viewsOk &&
-      minViewsOk &&
-      durationOk &&
-      !video.badMatch &&
-      video.matchScore >= 3 &&
-      video.matchRatio >= 0.2
-    );
-  });
-
-  const chosenPool = strictCandidates.length > 0 ? strictCandidates : relaxedCandidates;
-
-  if (chosenPool.length === 0) {
-    logDebug('No YouTube candidates survived', {
+  if (scoredVideos.length === 0) {
+    logDebug('No YouTube candidates survived simple search', {
       query,
       cleanQuery,
-      totalVideosFound: uniqueVideos.length,
-      filters,
-      sampleVideos: scoredVideos.slice(0, 8).map((video) => ({
+      totalVideosFound: videos.length,
+      sampleVideos: videos.slice(0, 5).map((video) => ({
         title: video.youtubeTitle,
         channel: video.youtubeChannel,
         views: video.youtubeViews,
         duration: video.durationSeconds,
         embeddable: video.embeddable,
-        badMatch: video.badMatch,
-        remixOrLive: video.remixOrLive,
-        score: video.matchScore,
-        ratio: video.matchRatio,
       })),
     });
 
     return null;
   }
 
-  const bestMatchScore = chosenPool[0].matchScore;
-
-  const sameTrackCandidates = chosenPool.filter((video) => {
-    return video.matchScore >= bestMatchScore - 4 && video.matchRatio >= 0.35;
-  });
-
-  const selectedVideo = sameTrackCandidates.sort(
-    (a, b) => b.youtubeViews - a.youtubeViews
-  )[0];
-
-  const popularityViews = Math.max(
-    ...sameTrackCandidates.map((video) => video.youtubeViews || 0)
-  );
+  const selectedVideo = scoredVideos[0];
 
   return {
     ...selectedVideo,
     selectedVideoViews: selectedVideo.youtubeViews,
-    popularityViews,
-    obscurityLabel: getObscurityLabel(popularityViews),
-    candidateCount: chosenPool.length,
+    popularityViews: selectedVideo.youtubeViews,
+    obscurityLabel: getObscurityLabel(selectedVideo.youtubeViews),
+    candidateCount: scoredVideos.length,
   };
 }
-
 app.get('/sample', async (req, res) => {
   try {
     const filters = {
@@ -431,7 +400,7 @@ app.get('/sample', async (req, res) => {
 
     logDebug('Sample request', { filters });
 
-    for (let i = 0; i < 25; i++) {
+   for (let i = 0; i < 5; i++) {
       const release = await findDiscogsRelease(filters);
 
       if (!release) {
